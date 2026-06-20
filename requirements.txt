@@ -1,0 +1,2 @@
+mpmath>=1.3.0
+gmpy2>=2.1.0   # optional: GMP/MPFR backend for ~5-10x speedup; remove line if build fails
