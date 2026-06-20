@@ -22,6 +22,8 @@ import argparse
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from decimal import Decimal
+from fractions import Fraction
 from itertools import combinations, product
 
 import mpmath
@@ -62,6 +64,29 @@ def _is_b0_additive(f1: PCFForm, f2: PCFForm, result: dict) -> bool:
         return False
     r, s, neg_p, _ = vec
     return r == 0 and s == -neg_p
+
+
+def _is_simple_rational(val: "mpmath.mpf", dps: int, max_denominator: int) -> bool:
+    """
+    Return True if val is numerically indistinguishable from a rational p/q
+    with |q| <= max_denominator.
+
+    Strategy: convert to a decimal string, find the best rational approximation
+    via Fraction.limit_denominator, then check the residual against the working
+    precision.  Uses Decimal as intermediary so scientific-notation strings
+    (e.g. "1.23e-8") parse correctly.
+
+    A CF that evaluates to a simple rational (e.g. -1, 1/2, 7/3) produces
+    Möbius relations of the form  CF2*(CF1 - p/q) = 0  which are vacuous —
+    they just restate that CF1 = p/q.
+    """
+    try:
+        s = mpmath.nstr(val, dps // 2)
+        frac = Fraction(Decimal(s)).limit_denominator(max_denominator)
+        residual = abs(val - mpmath.mpf(frac.numerator) / mpmath.mpf(frac.denominator))
+        return residual < mpmath.mpf(10) ** (-(dps // 3))
+    except Exception:
+        return False
 
 
 def _pslq_worker(
@@ -167,6 +192,7 @@ def run_search(
     max_degree: int = 1,
     workers: int | None = None,
     show_trivial: bool = False,
+    max_rational_denom: int = 10_000_000,
 ) -> None:
     """
     Run the full enumerate → evaluate → cluster → PSLQ pipeline.
@@ -180,7 +206,9 @@ def run_search(
     dps        : decimal-place precision for both evaluation and PSLQ
     max_degree   : max total monomial degree in the PSLQ basis (1 = Möbius)
     workers      : parallel worker processes (default: os.cpu_count())
-    show_trivial : include b0-additive relations in output (default: False)
+    show_trivial      : include b0-additive relations in output (default: False)
+    max_rational_denom: skip CFs whose value is p/q with |q| <= this bound;
+                        0 disables the filter (default: 10_000_000)
     """
     if workers is None:
         workers = os.cpu_count() or 4
@@ -255,6 +283,18 @@ def run_search(
     # ── Phase 4: PSLQ search in parallel ────────────────────────────────────
     # One representative (the first in each group) per distinct value.
     reps: list[tuple[PCFForm, mpmath.mpf]] = [g[0] for g in groups]
+
+    if max_rational_denom > 0:
+        reps_filtered = [
+            (f, v) for f, v in reps
+            if not _is_simple_rational(v, dps, max_rational_denom)
+        ]
+        n_rational = len(reps) - len(reps_filtered)
+        if n_rational:
+            print(f"\n  Skipping {n_rational} simple-rational value(s) "
+                  f"(p/q with |q| ≤ {max_rational_denom:,}) from PSLQ pairs.")
+        reps = reps_filtered
+
     n_pairs = len(reps) * (len(reps) - 1) // 2
 
     _bar("PHASE 4  —  PSLQ SEARCH")
@@ -354,6 +394,8 @@ def main() -> None:
                    help="Worker processes (default: CPU count)")
     p.add_argument("--show-trivial", action="store_true", default=False,
                    help="Also print b0-additive (trivially shifted) relations")
+    p.add_argument("--max-rational-denom", type=int, default=10_000_000,
+                   help="Skip CFs whose value is p/q with |q| <= N; 0 to disable")
     args = p.parse_args()
 
     run_search(
@@ -366,6 +408,7 @@ def main() -> None:
         max_degree=args.max_degree,
         workers=args.workers,
         show_trivial=args.show_trivial,
+        max_rational_denom=args.max_rational_denom,
     )
 
 
