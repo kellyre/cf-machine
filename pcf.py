@@ -29,21 +29,37 @@ class PCFForm:
     """
     Immutable description of a polynomial continued fraction.
 
-    a_coeffs : coefficients of a(n) in ascending degree order,
-               e.g. [0, 0, 1] means a(n) = n^2.
-               a(0) is unused; evaluation starts at a(1).
-    b_coeffs : coefficients of b(n) in ascending degree order.
-    b0       : the constant leading term (= b(0) if you want, but kept separate
-               so callers can override it independently of b(n)).
+    The CF is:  b0 + a(1)/(b(1) + a(2)/(b(2) + ...))
+
+    Each of a(n) and b(n) can be specified as either a polynomial (via
+    *_coeffs in ascending-degree order) or a raw integer sequence (via
+    *_seq, overrides *_coeffs when set).  The sequence is 0-indexed in the
+    tuple but provides 1-indexed CF inputs: a_seq[k-1] is a(k).
+
+    a_coeffs / b_coeffs : polynomial coefficients, ascending degree.
+                          e.g. (0, 0, 1) → n².  Ignored when the
+                          corresponding *_seq is not None.
+    b0                  : the leading constant term.
+    a_seq / b_seq       : raw integer sequences (e.g. from OEIS).
+                          Evaluation stops when the index exceeds len(*_seq).
+    a_seq_id / b_seq_id : human-readable label for display (e.g. 'A000045').
     """
     a_coeffs: tuple[int, ...]    # poly for a(n), ascending degree
     b_coeffs: tuple[int, ...]    # poly for b(n), ascending degree
     b0: int = 1                  # leading term
+    a_seq: tuple[int, ...] | None = None   # raw sequence for a(n); overrides a_coeffs
+    b_seq: tuple[int, ...] | None = None   # raw sequence for b(n); overrides b_coeffs
+    a_seq_id: str = ""
+    b_seq_id: str = ""
 
     def __post_init__(self) -> None:
-        # Normalise to tuples so the object is hashable/picklable.
+        # Normalise everything to tuples so the object is hashable/picklable.
         object.__setattr__(self, "a_coeffs", tuple(self.a_coeffs))
         object.__setattr__(self, "b_coeffs", tuple(self.b_coeffs))
+        if self.a_seq is not None:
+            object.__setattr__(self, "a_seq", tuple(self.a_seq))
+        if self.b_seq is not None:
+            object.__setattr__(self, "b_seq", tuple(self.b_seq))
 
 
 def _poly_eval(coeffs: tuple[int, ...], n: "mpmath.mpf") -> "mpmath.mpf":
@@ -141,11 +157,18 @@ def evaluate(form: PCFForm, dps: int, *, epsilon_depth: int = 0) -> "mpmath.mpf"
             collections.deque(maxlen=window) if window else None
         )
 
+        a_seq = form.a_seq
+        b_seq = form.b_seq
+        a_len = len(a_seq) if a_seq is not None else _MAX_ITER
+        b_len = len(b_seq) if b_seq is not None else _MAX_ITER
+
         converged = False
         for n in range(1, _MAX_ITER + 1):
+            if n > a_len or n > b_len:
+                break   # sequence(s) exhausted
             n_mp = mpmath.mpf(n)
-            an = _poly_eval(form.a_coeffs, n_mp)
-            bn = _poly_eval(form.b_coeffs, n_mp)
+            an = mpmath.mpf(a_seq[n - 1]) if a_seq is not None else _poly_eval(form.a_coeffs, n_mp)
+            bn = mpmath.mpf(b_seq[n - 1]) if b_seq is not None else _poly_eval(form.b_coeffs, n_mp)
 
             h_new = bn * h_curr + an * h_prev
             k_new = bn * k_curr + an * k_prev

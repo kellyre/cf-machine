@@ -28,6 +28,7 @@ from itertools import combinations, product
 
 import mpmath
 
+import oeis as oeis_mod
 from pcf import PCFForm, evaluate
 from relations import find_relation, format_polynomial, format_mobius
 
@@ -140,6 +141,64 @@ def enumerate_forms(
     return forms
 
 
+def enumerate_oeis_forms(
+    seqs: dict[str, tuple[int, ...]],
+    oeis_role: str,
+    max_coeff: int,
+    poly_degree: int,
+    b0_min: int,
+    b0_max: int,
+) -> list[PCFForm]:
+    """
+    Generate PCFForms where one slot is an OEIS sequence and the other is a
+    small polynomial.
+
+    oeis_role='a' : OEIS drives a(k), polynomial drives b(k)
+    oeis_role='b' : polynomial drives a(k), OEIS drives b(k)
+                    (seqs must already be filtered for all terms > 0)
+    """
+    cr = range(-max_coeff, max_coeff + 1)
+    forms: list[PCFForm] = []
+
+    if oeis_role == 'a':
+        poly_b_options = [
+            b for b in product(cr, repeat=poly_degree + 1)
+            if _b_stays_positive(b)
+        ]
+        for seq_id, terms in seqs.items():
+            if terms[0] == 0:       # a(1) must be nonzero
+                continue
+            for b_coeffs in poly_b_options:
+                for b0 in range(b0_min, b0_max + 1):
+                    forms.append(PCFForm(
+                        a_coeffs=(),
+                        b_coeffs=b_coeffs,
+                        b0=b0,
+                        a_seq=terms,
+                        a_seq_id=seq_id,
+                    ))
+    else:  # oeis_role == 'b'
+        poly_a_options = [
+            a for a in product(cr, repeat=poly_degree + 1)
+            if sum(a) != 0 and not all(c == 0 for c in a)
+        ]
+        for seq_id, terms in seqs.items():
+            for a_coeffs in poly_a_options:
+                for b0 in range(b0_min, b0_max + 1):
+                    forms.append(PCFForm(
+                        a_coeffs=a_coeffs,
+                        b_coeffs=(),
+                        b0=b0,
+                        b_seq=terms,
+                        b_seq_id=seq_id,
+                    ))
+    return forms
+
+
+def _is_oeis_form(form: PCFForm) -> bool:
+    return form.a_seq is not None or form.b_seq is not None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Value clustering
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,7 +223,9 @@ def _cluster(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _pcf_str(form: PCFForm) -> str:
-    return f"a={list(form.a_coeffs)}  b={list(form.b_coeffs)}  b0={form.b0}"
+    a_str = form.a_seq_id if form.a_seq is not None else str(list(form.a_coeffs))
+    b_str = form.b_seq_id if form.b_seq is not None else str(list(form.b_coeffs))
+    return f"a={a_str}  b={b_str}  b0={form.b0}"
 
 
 def _bar(title: str, width: int = 62) -> None:
@@ -182,6 +243,10 @@ def _progress(done: int, total: int, extra: str = "") -> None:
 # Main search pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
+_EVAL_BATCH: int = 8_000    # max live evaluation futures per batch
+_PSLQ_BATCH: int = 50_000  # max live PSLQ futures per batch
+
+
 def run_search(
     max_coeff: int = 2,
     a_degree: int = 1,
@@ -193,22 +258,43 @@ def run_search(
     workers: int | None = None,
     show_trivial: bool = False,
     max_rational_denom: int = 10_000_000,
+    oeis_path: str | None = None,
+    oeis_role: str = "a",
+    oeis_min_length: int = 100,
+    oeis_max_seqs: int | None = None,
+    oeis_max_abs_term: int | None = None,
 ) -> None:
     """
     Run the full enumerate → evaluate → cluster → PSLQ pipeline.
 
     Parameters
     ----------
-    max_coeff  : absolute coefficient bound for a(n) and b(n) polynomials
-    a_degree   : polynomial degree of the CF numerator a(n)
-    b_degree   : polynomial degree of the CF denominator b(n)
-    b0_min/max : range of the leading constant b0
-    dps        : decimal-place precision for both evaluation and PSLQ
-    max_degree   : max total monomial degree in the PSLQ basis (1 = Möbius)
-    workers      : parallel worker processes (default: os.cpu_count())
-    show_trivial      : include b0-additive relations in output (default: False)
-    max_rational_denom: skip CFs whose value is p/q with |q| <= this bound;
-                        0 disables the filter (default: 10_000_000)
+    max_coeff           : absolute coefficient bound for polynomial coefficients
+    a_degree            : degree of the polynomial a(n)
+    b_degree            : degree of the polynomial b(n)
+    b0_min / b0_max     : range of the leading constant b0
+    dps                 : decimal-place precision for evaluation and PSLQ
+    max_degree          : max total monomial degree in PSLQ basis (1=Möbius)
+    workers             : parallel worker processes (default: os.cpu_count())
+    show_trivial        : include b0-additive relations in output
+    max_rational_denom  : skip CFs whose value is p/q with |q| ≤ this; 0=off
+    oeis_path           : path to stripped OEIS file; enables OEIS mode
+    oeis_role           : 'a' → OEIS drives a(k), polynomial drives b(k)
+                          'b' → polynomial drives a(k), OEIS drives b(k)
+    oeis_min_length     : minimum sequence length to accept (default 100)
+    oeis_max_seqs       : cap on OEIS sequences loaded (None = all qualifying)
+    oeis_max_abs_term   : drop OEIS seqs with any |term| exceeding this
+
+    OEIS mode
+    ---------
+    When oeis_path is given, two form pools are built:
+      · Polynomial pool  — standard enumeration (max_coeff / a/b_degree)
+      · OEIS pool        — each OEIS sequence paired with every valid
+                           polynomial for the opposite slot
+    Phase 3 flags any cluster that contains forms from BOTH pools (direct
+    value match — the most exciting find).  Phase 4 runs PSLQ cross-pool
+    only (OEIS rep × poly rep), keeping the pair count at
+    N_oeis_reps × N_poly_reps rather than the full O(N²).
     """
     if workers is None:
         workers = os.cpu_count() or 4
@@ -216,43 +302,69 @@ def run_search(
     # ── Phase 1: Enumerate ──────────────────────────────────────────────────
     _bar("PHASE 1  —  ENUMERATE")
     t0 = time.perf_counter()
-    forms = enumerate_forms(max_coeff, a_degree, b_degree, b0_min, b0_max)
+
+    poly_forms = enumerate_forms(max_coeff, a_degree, b_degree, b0_min, b0_max)
     print(
-        f"  {len(forms):,} candidate forms  "
+        f"  {len(poly_forms):,} polynomial forms  "
         f"(max_coeff={max_coeff}, a_deg={a_degree}, b_deg={b_degree}, "
-        f"b0=[{b0_min},{b0_max}])  [{time.perf_counter()-t0:.2f}s]"
+        f"b0=[{b0_min},{b0_max}])"
     )
+
+    oeis_forms: list[PCFForm] = []
+    if oeis_path:
+        print(f"  Loading OEIS sequences …", end="", flush=True)
+        need_pos = (oeis_role == "b")
+        seqs = oeis_mod.load(
+            oeis_path,
+            min_length=oeis_min_length,
+            for_b=need_pos,
+            for_a=(not need_pos),
+            max_abs_term=oeis_max_abs_term,
+            max_seqs=oeis_max_seqs,
+        )
+        print(f" {len(seqs):,} qualifying sequences")
+        oeis_mod.stats(seqs)
+        poly_deg = b_degree if oeis_role == "a" else a_degree
+        oeis_forms = enumerate_oeis_forms(
+            seqs, oeis_role, max_coeff, poly_deg, b0_min, b0_max
+        )
+        print(f"  {len(oeis_forms):,} OEIS-based forms  (role={oeis_role})")
+
+    forms = poly_forms + oeis_forms
+    print(f"  {len(forms):,} total  [{time.perf_counter()-t0:.2f}s]")
 
     if not forms:
         print("  No forms generated — try relaxing the filters.")
         return
 
-    # ── Phase 2: Evaluate in parallel ───────────────────────────────────────
+    # ── Phase 2: Evaluate in parallel (batched) ─────────────────────────────
     _bar("PHASE 2  —  EVALUATE")
     print(f"  {len(forms):,} forms  ·  dps={dps}  ·  {workers} workers")
     t0 = time.perf_counter()
 
     form_vals: dict[PCFForm, mpmath.mpf] = {}
     n_failed = 0
+    done = 0
     tick = max(1, len(forms) // 40)
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futs = {pool.submit(_eval_worker, f, dps): f for f in forms}
-        done = 0
-        for fut in as_completed(futs):
-            done += 1
-            try:
-                form, val = fut.result()
-            except Exception:
-                n_failed += 1
-                continue
-            if val is not None:
-                form_vals[form] = val
-            else:
-                n_failed += 1
-            if done % tick == 0 or done == len(forms):
-                _progress(done, len(forms),
-                          f"  converged={len(form_vals):,}  failed={n_failed:,}")
+        for batch_start in range(0, len(forms), _EVAL_BATCH):
+            batch = forms[batch_start : batch_start + _EVAL_BATCH]
+            futs = {pool.submit(_eval_worker, f, dps): f for f in batch}
+            for fut in as_completed(futs):
+                done += 1
+                try:
+                    form, val = fut.result()
+                except Exception:
+                    n_failed += 1
+                    continue
+                if val is not None:
+                    form_vals[form] = val
+                else:
+                    n_failed += 1
+                if done % tick == 0 or done == len(forms):
+                    _progress(done, len(forms),
+                              f"  converged={len(form_vals):,}  failed={n_failed:,}")
 
     print(f"\n  elapsed: {time.perf_counter()-t0:.1f}s")
 
@@ -274,59 +386,79 @@ def run_search(
         print()
         for g in sorted((g for g in groups if len(g) > 1), key=lambda g: -len(g)):
             _, rep_val = g[0]
-            print(f"  ≡  {mpmath.nstr(rep_val, 12)}  ({len(g)} forms):")
+            has_oeis = any(_is_oeis_form(f) for f, _ in g)
+            has_poly = any(not _is_oeis_form(f) for f, _ in g)
+            cross_tag = "  *** OEIS↔poly match ***" if (has_oeis and has_poly) else ""
+            print(f"  ≡  {mpmath.nstr(rep_val, 12)}  ({len(g)} forms){cross_tag}:")
             for form, _ in g[:5]:
                 print(f"       {_pcf_str(form)}")
             if len(g) > 5:
                 print(f"       … and {len(g)-5} more")
 
-    # ── Phase 4: PSLQ search in parallel ────────────────────────────────────
-    # One representative (the first in each group) per distinct value.
-    reps: list[tuple[PCFForm, mpmath.mpf]] = [g[0] for g in groups]
+    # ── Phase 4: PSLQ search in parallel (batched) ──────────────────────────
+    all_reps: list[tuple[PCFForm, mpmath.mpf]] = [g[0] for g in groups]
 
     if max_rational_denom > 0:
-        reps_filtered = [
-            (f, v) for f, v in reps
+        before = len(all_reps)
+        all_reps = [
+            (f, v) for f, v in all_reps
             if not _is_simple_rational(v, dps, max_rational_denom)
         ]
-        n_rational = len(reps) - len(reps_filtered)
-        if n_rational:
-            print(f"\n  Skipping {n_rational} simple-rational value(s) "
+        n_rat = before - len(all_reps)
+        if n_rat:
+            print(f"\n  Skipping {n_rat} simple-rational value(s) "
                   f"(p/q with |q| ≤ {max_rational_denom:,}) from PSLQ pairs.")
-        reps = reps_filtered
 
-    n_pairs = len(reps) * (len(reps) - 1) // 2
+    # Cross-pool when OEIS is active; all-pairs otherwise.
+    if oeis_path and oeis_forms:
+        oeis_reps = [(f, v) for f, v in all_reps if _is_oeis_form(f)]
+        poly_reps  = [(f, v) for f, v in all_reps if not _is_oeis_form(f)]
+        n_pairs = len(oeis_reps) * len(poly_reps)
+        def _pair_iter():
+            for a in oeis_reps:
+                for b in poly_reps:
+                    yield a, b
+        pool_label = (f"  ({len(oeis_reps):,} OEIS × {len(poly_reps):,} poly, cross-pool)")
+    else:
+        n_pairs = len(all_reps) * (len(all_reps) - 1) // 2
+        def _pair_iter():
+            yield from combinations(all_reps, 2)
+        pool_label = ""
 
     _bar("PHASE 4  —  PSLQ SEARCH")
     if n_pairs == 0:
-        print("  Need ≥ 2 distinct values — increase bounds.")
+        print("  Need ≥ 2 distinct non-rational values — increase bounds.")
         return
 
-    print(f"  {len(reps):,} representatives  ·  {n_pairs:,} pairs"
-          f"  ·  degree≤{max_degree}  ·  {workers} workers")
+    print(f"  {n_pairs:,} pairs  ·  degree≤{max_degree}  ·  {workers} workers{pool_label}")
     t0 = time.perf_counter()
 
     found: list[tuple[PCFForm, mpmath.mpf, PCFForm, mpmath.mpf, dict]] = []
+    done = 0
     tick = max(1, n_pairs // 40)
+    pair_gen = _pair_iter()
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        pair_futs: dict = {}
-        for (f1, v1), (f2, v2) in combinations(reps, 2):
-            fut = pool.submit(_pslq_worker, v1, v2, dps, max_degree)
-            pair_futs[fut] = (f1, v1, f2, v2)
-
-        done = 0
-        for fut in as_completed(pair_futs):
-            f1, v1, f2, v2 = pair_futs[fut]
-            done += 1
-            try:
-                result = fut.result()
-            except Exception:
-                result = None
-            if result is not None:
-                found.append((f1, v1, f2, v2, result))
-            if done % tick == 0 or done == n_pairs:
-                _progress(done, n_pairs, f"  relations found: {len(found)}")
+        while True:
+            pair_futs: dict = {}
+            for (f1, v1), (f2, v2) in pair_gen:
+                fut = pool.submit(_pslq_worker, v1, v2, dps, max_degree)
+                pair_futs[fut] = (f1, v1, f2, v2)
+                if len(pair_futs) >= _PSLQ_BATCH:
+                    break
+            if not pair_futs:
+                break
+            for fut in as_completed(pair_futs):
+                f1, v1, f2, v2 = pair_futs[fut]
+                done += 1
+                try:
+                    result = fut.result()
+                except Exception:
+                    result = None
+                if result is not None:
+                    found.append((f1, v1, f2, v2, result))
+                if done % tick == 0 or done == n_pairs:
+                    _progress(done, n_pairs, f"  relations found: {len(found)}")
 
     print(f"\n  elapsed: {time.perf_counter()-t0:.1f}s")
 
@@ -354,14 +486,14 @@ def run_search(
 
     for i, (f1, v1, f2, v2, result) in enumerate(display_list, 1):
         vec = result["vector"]
-        display = format_polynomial(result).replace("v1", "CF1").replace("v2", "CF2")
+        poly_str = format_polynomial(result).replace("v1", "CF1").replace("v2", "CF2")
         mob = format_mobius(result, "CF1", "CF2") if len(vec) == 4 else None
         trivial_tag = "  [b0-additive]" if _is_b0_additive(f1, f2, result) else ""
 
         print(f"\n  [{i}]{trivial_tag}")
         print(f"      CF1: {_pcf_str(f1)}  ≈ {mpmath.nstr(v1, 12)}")
         print(f"      CF2: {_pcf_str(f2)}  ≈ {mpmath.nstr(v2, 12)}")
-        print(f"      Relation:  {display}")
+        print(f"      Relation:  {poly_str}")
         if mob:
             print(f"      Möbius:    {mob}")
         print(f"      Residual:  {float(result['residual']):.2e}")
@@ -396,6 +528,18 @@ def main() -> None:
                    help="Also print b0-additive (trivially shifted) relations")
     p.add_argument("--max-rational-denom", type=int, default=10_000_000,
                    help="Skip CFs whose value is p/q with |q| <= N; 0 to disable")
+    # OEIS options
+    p.add_argument("--oeis", metavar="PATH", default=None,
+                   help="Enable OEIS mode: path to stripped OEIS file")
+    p.add_argument("--oeis-role", choices=["a", "b"], default="a",
+                   help="'a': OEIS drives a(k), poly drives b(k) [default]; "
+                        "'b': poly drives a(k), OEIS drives b(k)")
+    p.add_argument("--oeis-min-length", type=int, default=100,
+                   help="Minimum sequence length to accept from OEIS file")
+    p.add_argument("--oeis-max-seqs", type=int, default=None,
+                   help="Cap on OEIS sequences loaded (default: all qualifying)")
+    p.add_argument("--oeis-max-abs-term", type=int, default=None,
+                   help="Drop OEIS sequences with any |term| exceeding this")
     args = p.parse_args()
 
     run_search(
@@ -409,6 +553,11 @@ def main() -> None:
         workers=args.workers,
         show_trivial=args.show_trivial,
         max_rational_denom=args.max_rational_denom,
+        oeis_path=args.oeis,
+        oeis_role=args.oeis_role,
+        oeis_min_length=args.oeis_min_length,
+        oeis_max_seqs=args.oeis_max_seqs,
+        oeis_max_abs_term=args.oeis_max_abs_term,
     )
 
 
