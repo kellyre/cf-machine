@@ -263,6 +263,10 @@ def run_search(
     oeis_min_length: int = 100,
     oeis_max_seqs: int | None = None,
     oeis_max_abs_term: int | None = None,
+    oeis_dedup: bool = True,
+    oeis_dedup_window: int = 10,
+    oeis_dedup_min_diff: int = 2,
+    oeis_dedup_max_shift: int = 2,
 ) -> None:
     """
     Run the full enumerate → evaluate → cluster → PSLQ pipeline.
@@ -321,8 +325,13 @@ def run_search(
             for_a=(not need_pos),
             max_abs_term=oeis_max_abs_term,
             max_seqs=oeis_max_seqs,
+            dedup=oeis_dedup,
+            dedup_window=oeis_dedup_window,
+            dedup_min_diff=oeis_dedup_min_diff,
+            dedup_max_shift=oeis_dedup_max_shift,
         )
-        print(f" {len(seqs):,} qualifying sequences")
+        print(f" {len(seqs):,} qualifying sequences"
+              + (" (after dedup)" if oeis_dedup else ""))
         oeis_mod.stats(seqs)
         poly_deg = b_degree if oeis_role == "a" else a_degree
         oeis_forms = enumerate_oeis_forms(
@@ -540,6 +549,14 @@ def main() -> None:
                    help="Cap on OEIS sequences loaded (default: all qualifying)")
     p.add_argument("--oeis-max-abs-term", type=int, default=None,
                    help="Drop OEIS sequences with any |term| exceeding this")
+    p.add_argument("--no-oeis-dedup", action="store_true", default=False,
+                   help="Disable sequence deduplication (not recommended)")
+    p.add_argument("--oeis-dedup-window", type=int, default=10,
+                   help="Number of leading terms compared for deduplication")
+    p.add_argument("--oeis-dedup-min-diff", type=int, default=2,
+                   help="Min differing terms in window to keep both sequences")
+    p.add_argument("--oeis-dedup-max-shift", type=int, default=2,
+                   help="Term shifts 1..N treated as duplicates")
     args = p.parse_args()
 
     run_search(
@@ -558,6 +575,10 @@ def main() -> None:
         oeis_min_length=args.oeis_min_length,
         oeis_max_seqs=args.oeis_max_seqs,
         oeis_max_abs_term=args.oeis_max_abs_term,
+        oeis_dedup=not args.no_oeis_dedup,
+        oeis_dedup_window=args.oeis_dedup_window,
+        oeis_dedup_min_diff=args.oeis_dedup_min_diff,
+        oeis_dedup_max_shift=args.oeis_dedup_max_shift,
     )
 
 
